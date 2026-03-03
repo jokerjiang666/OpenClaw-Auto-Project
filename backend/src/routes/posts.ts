@@ -1,144 +1,181 @@
-﻿import { Router } from 'express';
-import { Post } from '../models/Post';
-import { User } from '../models/User';
-import { Comment } from '../models/Comment';
+import { Router, Request, Response } from 'express';
+import { getDb, saveDb } from '../db/database';
 import { authMiddleware, AuthRequest } from '../middleware/auth';
 
 const router = Router();
 
-// Get all posts
-router.get('/', async (req, res) => {
+// 获取帖子列表
+router.get('/', async (req: Request, res: Response) => {
   try {
-    const { category, search, page = 1, limit = 10 } = req.query;
-    const where: any = {};
+    const db = getDb();
+    const { page = 1, limit = 10, category, search } = req.query;
+    const offset = (Number(page) - 1) * Number(limit);
     
-    if (category) where.category = category;
-    if (search) {
-      where[Op.or] = [
-        { title: { [Op.like]: '%' + search + '%' } },
-        { content: { [Op.like]: '%' + search + '%' } }
-      ];
-    }
+    let whereClause = '1=1';
+    if (category) whereClause += ` AND category = '${category}'`;
+    if (search) whereClause += ` AND (title LIKE '%${search}%' OR content LIKE '%${search}%')`;
     
-    const posts = await Post.findAndCountAll({
-      where,
-      include: [{
-        model: User,
-        attributes: ['id', 'username', 'avatar']
-      }],
-      order: [['createdAt', 'DESC']],
-      limit: Number(limit),
-      offset: (Number(page) - 1) * Number(limit)
-    });
+    const postsResult = db.exec(`
+      SELECT p.*, u.username, u.avatar,
+        (SELECT COUNT(*) FROM comments WHERE post_id = p.id) as comments_count
+      FROM posts p
+      JOIN users u ON p.author_id = u.id
+      WHERE ${whereClause}
+      ORDER BY p.is_pinned DESC, p.created_at DESC
+      LIMIT ${limit} OFFSET ${offset}
+    `);
+    
+    const posts = postsResult.length > 0 ? postsResult[0].columns.map((col, i) => {
+      const post: any = {};
+      postsResult[0].values.forEach(row => {
+        post[col] = row[i];
+      });
+      return post;
+    }).map((_, idx) => {
+      const post: any = {};
+      postsResult[0].columns.forEach((col, j) => {
+        post[col] = postsResult[0].values[idx][j];
+      });
+      return post;
+    }) : [];
+    
+    const countResult = db.exec(`SELECT COUNT(*) as total FROM posts WHERE ${whereClause}`);
+    const total = countResult.length > 0 ? countResult[0].values[0][0] : 0;
     
     res.json({
-      posts: posts.rows,
-      total: posts.count,
-      page: Number(page),
-      totalPages: Math.ceil(posts.count / Number(limit))
+      posts,
+      pagination: {
+        page: Number(page),
+        limit: Number(limit),
+        total,
+        totalPages: Math.ceil(total as number / Number(limit))
+      }
     });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    console.error('获取帖子列表错误:', error);
+    res.status(500).json({ error: '服务器错误' });
   }
 });
 
-// Get single post
-router.get('/:id', async (req, res) => {
+// 获取单个帖子
+router.get('/:id', async (req: Request, res: Response) => {
   try {
-    const post = await Post.findByPk(req.params.id, {
-      include: [
-        { model: User, attributes: ['id', 'username', 'avatar'] },
-        { 
-          model: Comment,
-          include: [{ model: User, attributes: ['id', 'username', 'avatar'] }]
-        }
-      ]
-    });
+    const db = getDb();
+    const { id } = req.params;
     
-    if (!post) {
-      return res.status(404).json({ error: 'Post not found' });
+    db.run(`UPDATE posts SET views = views + 1 WHERE id = ${id}`);
+    saveDb();
+    
+    const result = db.exec(`
+      SELECT p.*, u.username, u.avatar, u.bio as author_bio
+      FROM posts p
+      JOIN users u ON p.author_id = u.id
+      WHERE p.id = ${id}
+    `);
+    
+    if (result.length === 0 || result[0].values.length === 0) {
+      return res.status(404).json({ error: '帖子不存在' });
     }
     
-    await post.increment('views');
-    res.json(post);
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    const columns = result[0].columns;
+    const values = result[0].values[0];
+    const post: any = {};
+    columns.forEach((col, i) => post[col] = values[i]);
+    post.tags = JSON.parse(post.tags || '[]');
+    
+    res.json({ post });
+  } catch (error) {
+    console.error('获取帖子详情错误:', error);
+    res.status(500).json({ error: '服务器错误' });
   }
 });
 
-// Create post
-router.post('/', authMiddleware, async (req: AuthRequest, res) => {
+// 创建帖子
+router.post('/', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
-    const { title, content, category } = req.body;
+    const db = getDb();
+    const { title, content, category = 'general', tags = [] } = req.body;
     
-    const post = await Post.create({
-      title,
-      content,
-      category: category || 'general',
-      authorId: req.userId
-    });
+    if (!title || !content) {
+      return res.status(400).json({ error: '标题和内容不能为空' });
+    }
     
-    res.status(201).json(post);
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    db.run(`INSERT INTO posts (title, content, author_id, category, tags) VALUES (?, ?, ?, ?, ?)`,
+      [title, content, req.userId!, category, JSON.stringify(tags)]);
+    saveDb();
+    
+    const result = db.exec('SELECT last_insert_rowid() as id');
+    const postId = result[0].values[0][0];
+    
+    const postResult = db.exec(`
+      SELECT p.*, u.username, u.avatar
+      FROM posts p
+      JOIN users u ON p.author_id = u.id
+      WHERE p.id = ${postId}
+    `);
+    
+    const columns = postResult[0].columns;
+    const values = postResult[0].values[0];
+    const post: any = {};
+    columns.forEach((col, i) => post[col] = values[i]);
+    
+    res.status(201).json({ message: '发布成功', post });
+  } catch (error) {
+    console.error('创建帖子错误:', error);
+    res.status(500).json({ error: '服务器错误' });
   }
 });
 
-// Update post
-router.put('/:id', authMiddleware, async (req: AuthRequest, res) => {
+// 点赞帖子
+router.post('/:id/like', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
-    const post = await Post.findByPk(req.params.id);
+    const db = getDb();
+    const { id } = req.params;
+    const userId = req.userId!;
     
-    if (!post) {
-      return res.status(404).json({ error: 'Post not found' });
+    const existing = db.exec(`SELECT id FROM likes WHERE user_id = ${userId} AND target_type = 'post' AND target_id = ${id}`);
+    
+    if (existing.length > 0 && existing[0].values.length > 0) {
+      db.run(`DELETE FROM likes WHERE user_id = ${userId} AND target_type = 'post' AND target_id = ${id}`);
+      db.run(`UPDATE posts SET likes_count = likes_count - 1 WHERE id = ${id}`);
+      saveDb();
+      res.json({ message: '取消点赞', liked: false });
+    } else {
+      db.run(`INSERT INTO likes (user_id, target_type, target_id) VALUES (${userId}, 'post', ${id})`);
+      db.run(`UPDATE posts SET likes_count = likes_count + 1 WHERE id = ${id}`);
+      saveDb();
+      res.json({ message: '点赞成功', liked: true });
     }
-    
-    if (post.authorId !== req.userId) {
-      return res.status(403).json({ error: 'Not authorized' });
-    }
-    
-    await post.update(req.body);
-    res.json(post);
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    console.error('点赞错误:', error);
+    res.status(500).json({ error: '服务器错误' });
   }
 });
 
-// Delete post
-router.delete('/:id', authMiddleware, async (req: AuthRequest, res) => {
+// 删除帖子
+router.delete('/:id', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
-    const post = await Post.findByPk(req.params.id);
+    const db = getDb();
+    const { id } = req.params;
     
-    if (!post) {
-      return res.status(404).json({ error: 'Post not found' });
+    const result = db.exec(`SELECT author_id FROM posts WHERE id = ${id}`);
+    if (result.length === 0 || result[0].values.length === 0) {
+      return res.status(404).json({ error: '帖子不存在' });
     }
     
-    if (post.authorId !== req.userId) {
-      return res.status(403).json({ error: 'Not authorized' });
+    const authorId = result[0].values[0][0];
+    if (authorId !== req.userId) {
+      return res.status(403).json({ error: '无权删除此帖子' });
     }
     
-    await post.destroy();
-    res.json({ message: 'Post deleted' });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Like post
-router.post('/:id/like', authMiddleware, async (req: AuthRequest, res) => {
-  try {
-    const post = await Post.findByPk(req.params.id);
-    if (!post) {
-      return res.status(404).json({ error: 'Post not found' });
-    }
+    db.run(`DELETE FROM posts WHERE id = ${id}`);
+    saveDb();
     
-    await post.increment('likes');
-    res.json({ likes: post.likes + 1 });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.json({ message: '删除成功' });
+  } catch (error) {
+    console.error('删除帖子错误:', error);
+    res.status(500).json({ error: '服务器错误' });
   }
 });
 
 export default router;
-
-import { Op } from 'sequelize';

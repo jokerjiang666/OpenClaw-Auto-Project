@@ -6,10 +6,16 @@ let db: Database | null = null;
 
 const dbPath = path.join(__dirname, '../../data/forum.db');
 
-export const initDatabase = async (): Promise<Database> => {
-  if (db) return db;
+export const initDatabase = async (): Promise<void> => {
+  if (db) return;
 
   const SQL = await initSqlJs();
+  
+  // 确保数据目录存在
+  const dataDir = path.dirname(dbPath);
+  if (!fs.existsSync(dataDir)) {
+    fs.mkdirSync(dataDir, { recursive: true });
+  }
   
   if (fs.existsSync(dbPath)) {
     const fileBuffer = fs.readFileSync(dbPath);
@@ -66,7 +72,6 @@ export const initDatabase = async (): Promise<Database> => {
 
   saveDb();
   console.log('✅ 数据库初始化完成');
-  return db;
 };
 
 export const getDb = (): Database => {
@@ -74,11 +79,9 @@ export const getDb = (): Database => {
   return db;
 };
 
-export const saveDb = () => {
+export const saveDb = (): void => {
   if (!db) return;
   const data = db.export();
   const buffer = Buffer.from(data);
   fs.writeFileSync(dbPath, buffer);
 };
-
-export default { initDatabase, getDb, saveDb };
